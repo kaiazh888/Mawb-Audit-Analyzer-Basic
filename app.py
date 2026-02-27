@@ -190,6 +190,4 @@ try:
     df = raw_df.copy()
     df["MAWB"] = df[mawb_col].apply(normalize_mawb)
     df["Cost Amount"] = safe_numeric(df[cost_col])
-    df["Sell Amount"] = safe_numeric(df[sell_col])
-    df["Client"] = df[client_col].astype(str).str.strip() if client_col else "UNKNOWN"
-    df["Charge Code"] = df[charge_code_col].astype(str
+    df["Sell Amount"] = safe
