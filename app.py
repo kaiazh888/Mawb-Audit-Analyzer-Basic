@@ -191,4 +191,4 @@ try:
     df["MAWB"] = df[mawb_col].apply(normalize_mawb)
     df["Cost Amount"] = safe_numeric(df[cost_col])
     df["Sell Amount"] = safe_numeric(df[sell_col])
-    df
+    df["Client"] = df[client_col].
