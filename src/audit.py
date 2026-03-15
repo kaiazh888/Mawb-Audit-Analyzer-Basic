@@ -25,6 +25,7 @@ BILLING_OPTIONAL = {
     "Client": ["Client", "Customer", "Account", "Shipper", "Bill To", "Billed To"],
     "Charge Code": ["Charge Code", "ChargeCode", "Charge", "Code"],
     "Vendor": ["Vendor", "Carrier", "Supplier"],
+    "Destination": ["Destination", "Dest", "Branch", "Station", "To"],
 }
 ETA_REQUIRED = {
     "MAWB": ["MAWB", "Mawb", "Master AWB", "MasterAWB"],
@@ -79,6 +80,7 @@ class AuditResult:
 
 def _make_kpi_vertical(kpi_dict: dict, pct_keys: set[str]) -> pd.DataFrame:
     from .helpers import format_pct_str
+
     rows = []
     for k, v in kpi_dict.items():
         if k in pct_keys:
@@ -86,6 +88,37 @@ def _make_kpi_vertical(kpi_dict: dict, pct_keys: set[str]) -> pd.DataFrame:
         else:
             rows.append({"Metric": k, "Value": v})
     return pd.DataFrame(rows)
+
+
+def _clean_text_value(x) -> str:
+    s = str(x).strip()
+    if s.lower() in {"", "nan", "none"}:
+        return "UNKNOWN"
+    return s
+
+
+def _is_exempt_high_margin(client: str, destination: str, margin_pct: float) -> bool:
+    """
+    客户特殊豁免规则：
+    1) HANCAIWUX: Destination in {MIA, ORD} and Margin > 80%
+    2) 4PXDIGHKG: Destination in {MIA, LAX, ORD} and Margin > 80%
+    """
+    if pd.isna(margin_pct):
+        return False
+
+    client_u = str(client).strip().upper()
+    dest_u = str(destination).strip().upper()
+
+    if margin_pct <= 0.80:
+        return False
+
+    if client_u == "HANCAIWUX" and dest_u in {"MIA", "ORD"}:
+        return True
+
+    if client_u == "4PXDIGHKG" and dest_u in {"MIA", "LAX", "ORD"}:
+        return True
+
+    return False
 
 
 @st.cache_data(show_spinner=False)
@@ -114,33 +147,39 @@ def run_audit(
     client_col = find_first_col(raw_df, BILLING_OPTIONAL["Client"])
     charge_code_col = find_first_col(raw_df, BILLING_OPTIONAL["Charge Code"])
     vendor_col = find_first_col(raw_df, BILLING_OPTIONAL["Vendor"])
+    destination_col = find_first_col(raw_df, BILLING_OPTIONAL["Destination"])
 
     if not (mawb_col and cost_col and sell_col):
         raise ValueError("Billing sheet found but required columns could not be detected after scanning.")
 
-    # Normalize billing
+    # ---- Normalize billing ----
     df = raw_df.copy()
     df["MAWB"] = df[mawb_col].apply(normalize_mawb)
     df["Cost Amount"] = safe_numeric(df[cost_col])
     df["Sell Amount"] = safe_numeric(df[sell_col])
 
     if client_col:
-        df["Client"] = df[client_col].astype(str).str.strip()
-        df.loc[df["Client"].isin(["", "nan", "None"]), "Client"] = "UNKNOWN"
+        df["Client"] = df[client_col].apply(_clean_text_value)
     else:
         df["Client"] = "UNKNOWN"
 
     if charge_code_col:
-        df["Charge Code"] = df[charge_code_col].astype(str).str.strip()
-        df.loc[df["Charge Code"].isin(["", "nan", "None"]), "Charge Code"] = "UNKNOWN"
+        df["Charge Code"] = df[charge_code_col].apply(_clean_text_value)
     else:
         df["Charge Code"] = "UNKNOWN"
 
     if vendor_col:
-        df["Vendor"] = df[vendor_col].astype(str).str.strip()
-        df.loc[df["Vendor"].isin(["", "nan", "None"]), "Vendor"] = "UNKNOWN"
+        df["Vendor"] = df[vendor_col].apply(_clean_text_value)
     else:
         df["Vendor"] = "UNKNOWN"
+
+    if destination_col:
+        df["Destination"] = df[destination_col].apply(_clean_text_value).str.upper()
+    else:
+        df["Destination"] = "UNKNOWN"
+
+    # Raw 中新增 Branch = Destination
+    df["Branch"] = df["Destination"]
 
     df = df[df["MAWB"].ne("")].copy()
 
@@ -154,7 +193,6 @@ def run_audit(
         mawb_not_found = sorted(set(mawb_keep) - found_set)
         mawb_not_found_df = pd.DataFrame({"MAWB": mawb_not_found})
 
-        # Keep a small info note in dataframe? UI shows separately anyway.
         _ = (before_mawb, after_mawb)
     else:
         mawb_not_found = []
@@ -203,6 +241,8 @@ def run_audit(
         df.groupby("MAWB", as_index=False)
         .agg(
             Client=("Client", "first"),
+            Destination=("Destination", "first"),
+            Branch=("Branch", "first"),
             Total_Cost=("Cost Amount", "sum"),
             Total_Sell=("Sell Amount", "sum"),
             Line_Count=("MAWB", "size"),
@@ -214,15 +254,11 @@ def run_audit(
     summary["Profit"] = summary["Total_Sell"] - summary["Total_Cost"]
     summary["Profit Margin %"] = pct(summary["Profit"], summary["Total_Sell"])
 
-    def is_closed(r) -> str:
-        if not (r["Total_Cost"] > 0 and r["Total_Sell"] > 0):
-            return "Open"
-        pm = r["Profit Margin %"]
-        if (pm < low_thr) or (pm > high_thr):
-            return "Open"
-        return "Closed"
-
-    summary["Classification"] = summary.apply(is_closed, axis=1)
+    # 客户+Destination 对高毛利豁免
+    summary["High_Margin_Exempt"] = summary.apply(
+        lambda r: _is_exempt_high_margin(r["Client"], r["Destination"], r["Profit Margin %"]),
+        axis=1,
+    )
 
     def exception_type(r) -> str:
         if r["Total_Cost"] == 0 and r["Total_Sell"] == 0:
@@ -231,12 +267,24 @@ def run_audit(
             return "Revenue=0"
         if r["Total_Cost"] == 0:
             return "Cost=0"
+
         pm = r["Profit Margin %"]
-        if (pm != 0) and ((pm < low_thr) or (pm > high_thr)):
-            return MARGIN_LABEL
+
+        # 高毛利先判断豁免
+        if pm > high_thr and not r["High_Margin_Exempt"]:
+            return f"Margin>{int(high_thr*100)}%"
+
+        if pm < low_thr:
+            return f"Margin<{int(low_thr*100)}%"
+
         return ""
 
     summary["Exception_Type"] = summary.apply(exception_type, axis=1)
+
+    def is_closed(r) -> str:
+        return "Closed" if r["Exception_Type"] == "" else "Open"
+
+    summary["Classification"] = summary.apply(is_closed, axis=1)
 
     exceptions = summary[summary["Classification"].eq("Open")].copy()
 
@@ -256,9 +304,12 @@ def run_audit(
     client_summary = client_summary.sort_values("Profit", ascending=False)
 
     # ---- Margin Outliers / Negative Profit ----
+    # 这里也同步应用豁免逻辑，避免 exempt 的 high margin 仍出现在 outliers 里
     margin_outliers = summary[
-        ((summary["Profit Margin %"] < low_thr) | (summary["Profit Margin %"] > high_thr))
-        & (summary["Profit Margin %"] != 0)
+        (
+            (summary["Exception_Type"] == f"Margin>{int(high_thr*100)}%")
+            | (summary["Exception_Type"] == f"Margin<{int(low_thr*100)}%")
+        )
     ].copy().sort_values("Profit Margin %")
 
     negative_profit = summary[summary["Profit"] < 0].copy().sort_values("Profit")
@@ -349,6 +400,8 @@ def run_audit(
         df.groupby(["MAWB", "Charge Code"], as_index=False)
         .agg(
             Client=("Client", "first"),
+            Destination=("Destination", "first"),
+            Branch=("Branch", "first"),
             Vendor=("Vendor", "first"),
             Total_Cost=("Cost Amount", "sum"),
             Total_Sell=("Sell Amount", "sum"),
@@ -380,6 +433,9 @@ def run_audit(
 
     eta_filled_ratio = float((summary["ETA"].notna().sum() / total_mawb)) if total_mawb else 0
 
+    margin_gt_label = f"Margin>{int(high_thr*100)}%"
+    margin_lt_label = f"Margin<{int(low_thr*100)}%"
+
     kpi_dict = {
         "Total MAWB": total_mawb,
         "Closed Count": closed_cnt,
@@ -388,7 +444,8 @@ def run_audit(
         "Revenue=0 Count": int((summary["Exception_Type"] == "Revenue=0").sum()),
         "Cost=0 Count": int((summary["Exception_Type"] == "Cost=0").sum()),
         "Cost=Sell=0 Count": int((summary["Exception_Type"] == "Cost=Sell=0").sum()),
-        f"{MARGIN_LABEL} Count": int((summary["Exception_Type"] == MARGIN_LABEL).sum()),
+        f"{margin_gt_label} Count": int((summary["Exception_Type"] == margin_gt_label).sum()),
+        f"{margin_lt_label} Count": int((summary["Exception_Type"] == margin_lt_label).sum()),
         "Total Cost": float(summary["Total_Cost"].sum()),
         "Total Sell": total_sell_sum,
         "Total Profit": total_profit_sum,
