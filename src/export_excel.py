@@ -34,7 +34,6 @@ def build_excel_report(result) -> bytes:
     df_x = to_date_only(result.df, ["ETA"])
     chargecode_profit_le0_mawb_x = to_date_only(result.chargecode_profit_le0_mawb, ["ETA"])
 
-    # For formatting (which sheets have Profit Margin %)
     percent_sheets = {
         "Exceptions": exceptions_x,
         "MAWB_Summary": summary_x,
@@ -73,7 +72,7 @@ def build_excel_report(result) -> bytes:
             ("Open exceptions overview + detail", "Exceptions"),
             ("MAWB level summary + detail", "MAWB_Summary"),
             ("Client margin summary + detail", "Client_Summary"),
-            (f"Margin anomalies ({result.margin_label}) + detail", "Margin_Outliers"),
+            ("Margin anomalies + detail", "Margin_Outliers"),
             ("Negative profit MAWBs + detail", "Negative_Profit"),
             ("Zero margin tickets + detail", "Zero_Margin"),
             ("Zero profit tickets + detail", "Zero_Profit"),
@@ -99,14 +98,12 @@ def build_excel_report(result) -> bytes:
         ws.write(kpi_row + 1, 0, "Metric", bold_fmt)
         ws.write(kpi_row + 1, 1, "Value", bold_fmt)
 
-        # We rebuild KPI dict from the vertical table (Metric/Value)
         kpi_write_row = kpi_row + 2
         for i in range(len(result.kpi_vertical)):
             metric = result.kpi_vertical.loc[i, "Metric"]
             value = result.kpi_vertical.loc[i, "Value"]
             ws.write(kpi_write_row + i, 0, metric)
 
-            # If looks like percent string "xx.xx%"
             if isinstance(value, str) and value.endswith("%"):
                 try:
                     v = float(value.replace("%", "")) / 100.0
@@ -114,7 +111,6 @@ def build_excel_report(result) -> bytes:
                 except Exception:
                     ws.write(kpi_write_row + i, 1, value)
             else:
-                # try numeric
                 try:
                     ws.write_number(kpi_write_row + i, 1, float(value), number_fmt)
                 except Exception:
@@ -144,9 +140,14 @@ def build_excel_report(result) -> bytes:
         # Embed ChargeCode_Summary + Vendor_Summary (preview)
         cc_row = neg_row + 6
         ws.write(cc_row, 0, "ChargeCode_Summary (embedded)", subheader_fmt)
-        result.chargecode_summary.to_excel(writer, index=False, sheet_name="Analysis Summary", startrow=cc_row + 1, startcol=0)
+        result.chargecode_summary.to_excel(
+            writer,
+            index=False,
+            sheet_name="Analysis Summary",
+            startrow=cc_row + 1,
+            startcol=0,
+        )
 
-        # Format Profit Margin % column in embedded CC table
         try:
             pm_idx = list(result.chargecode_summary.columns).index("Profit Margin %")
             _set_col_format(ws, workbook, pm_idx, width=16, num_format=PERCENT_FMT, startcol=0)
@@ -155,9 +156,14 @@ def build_excel_report(result) -> bytes:
 
         v_row = cc_row + 2 + len(result.chargecode_summary) + 3
         ws.write(v_row, 0, "Vendor_Summary (embedded)", subheader_fmt)
-        result.vendor_summary.to_excel(writer, index=False, sheet_name="Analysis Summary", startrow=v_row + 1, startcol=0)
+        result.vendor_summary.to_excel(
+            writer,
+            index=False,
+            sheet_name="Analysis Summary",
+            startrow=v_row + 1,
+            startcol=0,
+        )
 
-        # Format Profit Margin % in embedded vendor table too
         try:
             pm_idx_v = list(result.vendor_summary.columns).index("Profit Margin %")
             _set_col_format(ws, workbook, pm_idx_v, width=16, num_format=PERCENT_FMT, startcol=0)
@@ -191,10 +197,10 @@ def build_excel_report(result) -> bytes:
                 pm_col = list(dfx.columns).index("Profit Margin %")
                 _set_col_format(ws2, workbook, pm_col, width=16, num_format=PERCENT_FMT, startcol=0)
 
-        # Make columns a bit wider for readability (optional quick wins)
+        # Make columns wider
         for sh in writer.sheets:
             wsx = writer.sheets[sh]
-            wsx.set_column(0, 0, 18)  # first col
-            wsx.set_column(1, 5, 16)  # middle cols
+            wsx.set_column(0, 0, 18)
+            wsx.set_column(1, 8, 16)
 
     return output.getvalue()
