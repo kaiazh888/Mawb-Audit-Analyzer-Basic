@@ -35,16 +35,13 @@ ETA_REQUIRED = {
 
 @dataclass
 class AuditResult:
-    # Inputs
     mawb_keep: list[str]
     mawb_not_found_df: pd.DataFrame
     eta_parse_note: str | None
 
-    # KPI
     kpi_vertical: pd.DataFrame
     neg_summary: pd.DataFrame
 
-    # Core dataframes (raw for export)
     df: pd.DataFrame
     summary: pd.DataFrame
     exceptions: pd.DataFrame
@@ -62,7 +59,6 @@ class AuditResult:
     mawb_not_found: list[str]
     margin_label: str
 
-    # Display dfs (formatted strings)
     display_summary: pd.DataFrame
     display_exceptions: pd.DataFrame
     display_client_summary: pd.DataFrame
@@ -98,11 +94,6 @@ def _clean_text_value(x) -> str:
 
 
 def _is_exempt_high_margin(client: str, destination: str, margin_pct: float) -> bool:
-    """
-    客户特殊豁免规则：
-    1) HANCAIWUX: Destination in {MIA, ORD} and Margin > 80%
-    2) 4PXDIGHKG: Destination in {MIA, LAX, ORD} and Margin > 80%
-    """
     if pd.isna(margin_pct):
         return False
 
@@ -131,7 +122,6 @@ def run_audit(
 ) -> AuditResult:
     MARGIN_LABEL = f"Margin<{int(low_thr*100)}% or >{int(high_thr*100)}%"
 
-    # ---- Read billing charges ----
     xls = pd.ExcelFile(billing_file)
     billing_sheet = find_sheet_with_required_cols(xls, BILLING_REQUIRED)
     if not billing_sheet:
@@ -152,7 +142,6 @@ def run_audit(
     if not (mawb_col and cost_col and sell_col):
         raise ValueError("Billing sheet found but required columns could not be detected after scanning.")
 
-    # ---- Normalize billing ----
     df = raw_df.copy()
     df["MAWB"] = df[mawb_col].apply(normalize_mawb)
     df["Cost Amount"] = safe_numeric(df[cost_col])
@@ -178,27 +167,21 @@ def run_audit(
     else:
         df["Destination"] = "UNKNOWN"
 
-    # Raw 中新增 Branch = Destination
+    # Raw 里新增 Branch
     df["Branch"] = df["Destination"]
 
     df = df[df["MAWB"].ne("")].copy()
 
-    # ---- Optional MAWB filter ----
     mawb_keep = parse_mawb_list(mawb_text)
     if mawb_keep:
-        before_mawb = df["MAWB"].nunique()
         df = df[df["MAWB"].isin(mawb_keep)].copy()
-        after_mawb = df["MAWB"].nunique()
         found_set = set(df["MAWB"].unique())
         mawb_not_found = sorted(set(mawb_keep) - found_set)
         mawb_not_found_df = pd.DataFrame({"MAWB": mawb_not_found})
-
-        _ = (before_mawb, after_mawb)
     else:
         mawb_not_found = []
         mawb_not_found_df = pd.DataFrame({"MAWB": []})
 
-    # ---- Read ETA mapping (optional) ----
     eta_map = None
     eta_parse_note = None
 
@@ -228,7 +211,6 @@ def run_audit(
                     .max()
                 )
 
-    # ---- Merge ETA into billing ----
     if eta_map is not None and not eta_map.empty:
         df = df.merge(eta_map, on="MAWB", how="left")
     else:
@@ -236,7 +218,6 @@ def run_audit(
 
     df["ETA"] = pd.to_datetime(df["ETA"], errors="coerce").dt.normalize()
 
-    # ---- MAWB summary ----
     summary = (
         df.groupby("MAWB", as_index=False)
         .agg(
@@ -254,7 +235,7 @@ def run_audit(
     summary["Profit"] = summary["Total_Sell"] - summary["Total_Cost"]
     summary["Profit Margin %"] = pct(summary["Profit"], summary["Total_Sell"])
 
-    # 客户+Destination 对高毛利豁免
+    # 高毛利豁免
     summary["High_Margin_Exempt"] = summary.apply(
         lambda r: _is_exempt_high_margin(r["Client"], r["Destination"], r["Profit Margin %"]),
         axis=1,
@@ -270,25 +251,18 @@ def run_audit(
 
         pm = r["Profit Margin %"]
 
-        # 高毛利先判断豁免
         if pm > high_thr and not r["High_Margin_Exempt"]:
             return f"Margin>{int(high_thr*100)}%"
-
         if pm < low_thr:
             return f"Margin<{int(low_thr*100)}%"
 
         return ""
 
     summary["Exception_Type"] = summary.apply(exception_type, axis=1)
-
-    def is_closed(r) -> str:
-        return "Closed" if r["Exception_Type"] == "" else "Open"
-
-    summary["Classification"] = summary.apply(is_closed, axis=1)
+    summary["Classification"] = summary["Exception_Type"].apply(lambda x: "Closed" if x == "" else "Open")
 
     exceptions = summary[summary["Classification"].eq("Open")].copy()
 
-    # ---- Client Summary ----
     client_summary = (
         df.groupby("Client", as_index=False)
         .agg(
@@ -303,18 +277,15 @@ def run_audit(
     client_summary["Profit Margin %"] = pct(client_summary["Profit"], client_summary["Total_Sell"])
     client_summary = client_summary.sort_values("Profit", ascending=False)
 
-    # ---- Margin Outliers / Negative Profit ----
-    # 这里也同步应用豁免逻辑，避免 exempt 的 high margin 仍出现在 outliers 里
+    # 这里只保留真正要算异常的 margin
     margin_outliers = summary[
-        (
-            (summary["Exception_Type"] == f"Margin>{int(high_thr*100)}%")
-            | (summary["Exception_Type"] == f"Margin<{int(low_thr*100)}%")
+        summary["Exception_Type"].isin(
+            [f"Margin>{int(high_thr*100)}%", f"Margin<{int(low_thr*100)}%"]
         )
     ].copy().sort_values("Profit Margin %")
 
     negative_profit = summary[summary["Profit"] < 0].copy().sort_values("Profit")
 
-    # ---- Zero buckets ----
     zero_margin = summary[summary["Profit Margin %"] == 0].copy().sort_values(
         ["Total_Sell", "Total_Cost"], ascending=False
     )
@@ -330,7 +301,6 @@ def run_audit(
         "Total_Sell", ascending=False
     )
 
-    # ---- Charge Code Summary ----
     chargecode_summary = (
         df.groupby("Charge Code", as_index=False)
         .agg(
@@ -344,7 +314,6 @@ def run_audit(
     chargecode_summary["Profit Margin %"] = pct(chargecode_summary["Profit"], chargecode_summary["Total_Sell"])
     chargecode_summary = chargecode_summary.sort_values("Profit", ascending=False)
 
-    # Charge code exception counts (MAWB-level flags)
     mawb_flags = summary[["MAWB", "Exception_Type"]].copy()
     mawb_charge = df[["MAWB", "Charge Code"]].drop_duplicates()
     cc_exc = mawb_charge.merge(mawb_flags, on="MAWB", how="left")
@@ -365,7 +334,6 @@ def run_audit(
         .fillna(0)
     )
 
-    # ---- Vendor Summary ----
     vendor_summary = (
         df.groupby("Vendor", as_index=False)
         .agg(
@@ -395,7 +363,6 @@ def run_audit(
 
     vendor_summary = vendor_summary.merge(vendor_exceptions, on="Vendor", how="left").fillna(0)
 
-    # ---- Charge Code Profit <= 0 by MAWB ----
     cc_mawb = (
         df.groupby(["MAWB", "Charge Code"], as_index=False)
         .agg(
@@ -418,7 +385,6 @@ def run_audit(
         .sort_values(["Profit", "Total_Sell"], ascending=[True, False])
     )
 
-    # ---- KPI / Summary numbers ----
     total_mawb = int(len(summary))
     closed_cnt = int((summary["Classification"] == "Closed").sum())
     open_cnt = total_mawb - closed_cnt
@@ -430,7 +396,6 @@ def run_audit(
     neg_profit_cnt = int((summary["Profit"] < 0).sum())
     neg_profit_amt = float(summary.loc[summary["Profit"] < 0, "Profit"].sum())
     neg_profit_ratio = (neg_profit_cnt / total_mawb) if total_mawb else 0
-
     eta_filled_ratio = float((summary["ETA"].notna().sum() / total_mawb)) if total_mawb else 0
 
     margin_gt_label = f"Margin>{int(high_thr*100)}%"
@@ -463,7 +428,6 @@ def run_audit(
         ]
     )
 
-    # ---- Display versions for Streamlit ----
     display_summary = display_df(summary, date_cols=["ETA"])
     display_exceptions = display_df(exceptions, date_cols=["ETA"])
     display_client_summary = display_df(client_summary, date_cols=["Latest_ETA"])
