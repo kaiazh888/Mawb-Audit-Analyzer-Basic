@@ -12,15 +12,8 @@ def _set_col_format(ws, workbook, col_idx: int, width: int, num_format: str, sta
 
 
 def build_excel_report(result) -> bytes:
-    """
-    Build a multi-tab Excel report, with:
-    - Analysis Summary (hyperlinks + KPI table + embedded ChargeCode/Vendor)
-    - Detail sheets
-    - Profit Margin % columns formatted as percent where numeric
-    """
     output = io.BytesIO()
 
-    # Prepare export copies (date-only)
     summary_x = to_date_only(result.summary, ["ETA"])
     exceptions_x = to_date_only(result.exceptions, ["ETA"])
     client_summary_x = to_date_only(result.client_summary, ["Latest_ETA"])
@@ -59,7 +52,6 @@ def build_excel_report(result) -> bytes:
         percent_fmt = workbook.add_format({"num_format": PERCENT_FMT})
         number_fmt = workbook.add_format({"num_format": NUMBER_FMT})
 
-        # ---------------- Analysis Summary sheet ----------------
         ws = workbook.add_worksheet("Analysis Summary")
         writer.sheets["Analysis Summary"] = ws
 
@@ -92,7 +84,6 @@ def build_excel_report(result) -> bytes:
             ws.write_url(r, 0, f"internal:'{sheet_name}'!A1", string=text)
             r += 1
 
-        # KPI block
         kpi_row = r + 1
         ws.write(kpi_row, 0, "KPI (two-column)", subheader_fmt)
         ws.write(kpi_row + 1, 0, "Metric", bold_fmt)
@@ -116,7 +107,6 @@ def build_excel_report(result) -> bytes:
                 except Exception:
                     ws.write(kpi_write_row + i, 1, str(value))
 
-        # Negative profit summary
         neg_row = kpi_write_row + len(result.kpi_vertical) + 2
         ws.write(neg_row, 0, "Summary: Profit < 0", subheader_fmt)
         ws.write(neg_row + 1, 0, "Metric", bold_fmt)
@@ -137,7 +127,6 @@ def build_excel_report(result) -> bytes:
                 except Exception:
                     ws.write(neg_row + 2 + i, 1, str(v))
 
-        # Embed ChargeCode_Summary + Vendor_Summary (preview)
         cc_row = neg_row + 6
         ws.write(cc_row, 0, "ChargeCode_Summary (embedded)", subheader_fmt)
         result.chargecode_summary.to_excel(
@@ -170,7 +159,6 @@ def build_excel_report(result) -> bytes:
         except Exception:
             pass
 
-        # ---------------- Detail sheets ----------------
         exceptions_x.to_excel(writer, index=False, sheet_name="Exceptions")
         summary_x.to_excel(writer, index=False, sheet_name="MAWB_Summary")
         client_summary_x.to_excel(writer, index=False, sheet_name="Client_Summary")
@@ -190,17 +178,15 @@ def build_excel_report(result) -> bytes:
 
         df_x.to_excel(writer, index=False, sheet_name="Raw_Billing_Enriched")
 
-        # Apply percent format to Profit Margin % column in all relevant sheets
         for sh, dfx in percent_sheets.items():
             if sh in writer.sheets and "Profit Margin %" in dfx.columns:
                 ws2 = writer.sheets[sh]
                 pm_col = list(dfx.columns).index("Profit Margin %")
                 _set_col_format(ws2, workbook, pm_col, width=16, num_format=PERCENT_FMT, startcol=0)
 
-        # Make columns wider
         for sh in writer.sheets:
             wsx = writer.sheets[sh]
             wsx.set_column(0, 0, 18)
-            wsx.set_column(1, 8, 16)
+            wsx.set_column(1, 20, 16)
 
     return output.getvalue()
