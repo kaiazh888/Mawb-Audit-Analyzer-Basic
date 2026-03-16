@@ -25,7 +25,6 @@ BILLING_OPTIONAL = {
     "Client": ["Client", "Customer", "Account", "Shipper", "Bill To", "Billed To"],
     "Charge Code": ["Charge Code", "ChargeCode", "Charge", "Code"],
     "Vendor": ["Vendor", "Carrier", "Supplier"],
-    "Destination": ["Destination", "Dest", "Branch", "Station", "To"],
 }
 ETA_REQUIRED = {
     "MAWB": ["MAWB", "Mawb", "Master AWB", "MasterAWB"],
@@ -137,7 +136,6 @@ def run_audit(
     client_col = find_first_col(raw_df, BILLING_OPTIONAL["Client"])
     charge_code_col = find_first_col(raw_df, BILLING_OPTIONAL["Charge Code"])
     vendor_col = find_first_col(raw_df, BILLING_OPTIONAL["Vendor"])
-    destination_col = find_first_col(raw_df, BILLING_OPTIONAL["Destination"])
 
     if not (mawb_col and cost_col and sell_col):
         raise ValueError("Billing sheet found but required columns could not be detected after scanning.")
@@ -162,14 +160,6 @@ def run_audit(
     else:
         df["Vendor"] = "UNKNOWN"
 
-    if destination_col:
-        df["Destination"] = df[destination_col].apply(_clean_text_value).str.upper()
-    else:
-        df["Destination"] = "UNKNOWN"
-
-    # Raw 里新增 Branch
-    df["Branch"] = df["Destination"]
-
     df = df[df["MAWB"].ne("")].copy()
 
     mawb_keep = parse_mawb_list(mawb_text)
@@ -190,13 +180,20 @@ def run_audit(
         map_sheet = find_sheet_with_required_cols(xls2, ETA_REQUIRED)
         if map_sheet:
             mdf0 = pd.read_excel(xls2, sheet_name=map_sheet)
+
             m_mawb = find_first_col(mdf0, ETA_REQUIRED["MAWB"])
             m_eta = find_first_col(mdf0, ETA_REQUIRED["ETA"])
+
             if m_mawb and m_eta:
-                mdf = mdf0[[m_mawb, m_eta]].copy()
-                mdf.columns = ["MAWB", "ETA"]
-                mdf["MAWB"] = mdf["MAWB"].apply(normalize_mawb)
-                mdf["ETA"] = clean_eta_series(mdf["ETA"])
+                mdf = pd.DataFrame()
+                mdf["MAWB"] = mdf0[m_mawb].apply(normalize_mawb)
+                mdf["ETA"] = clean_eta_series(mdf0[m_eta])
+
+                # Destination 固定取 ETA 上传表 F 列（第6列，index=5）
+                if len(mdf0.columns) >= 6:
+                    mdf["Destination"] = mdf0.iloc[:, 5].apply(_clean_text_value).str.upper()
+                else:
+                    mdf["Destination"] = "UNKNOWN"
 
                 bad_eta_rows = int(mdf["ETA"].isna().sum())
                 total_rows = int(len(mdf))
@@ -207,16 +204,22 @@ def run_audit(
 
                 eta_map = (
                     mdf.dropna(subset=["MAWB"])
-                    .groupby("MAWB", as_index=False)["ETA"]
-                    .max()
+                    .groupby("MAWB", as_index=False)
+                    .agg(
+                        ETA=("ETA", "max"),
+                        Destination=("Destination", "first"),
+                    )
                 )
 
     if eta_map is not None and not eta_map.empty:
         df = df.merge(eta_map, on="MAWB", how="left")
     else:
         df["ETA"] = pd.NaT
+        df["Destination"] = "UNKNOWN"
 
     df["ETA"] = pd.to_datetime(df["ETA"], errors="coerce").dt.normalize()
+    df["Destination"] = df["Destination"].fillna("UNKNOWN").astype(str).str.upper()
+    df["Branch"] = df["Destination"]
 
     summary = (
         df.groupby("MAWB", as_index=False)
@@ -235,7 +238,6 @@ def run_audit(
     summary["Profit"] = summary["Total_Sell"] - summary["Total_Cost"]
     summary["Profit Margin %"] = pct(summary["Profit"], summary["Total_Sell"])
 
-    # 高毛利豁免
     summary["High_Margin_Exempt"] = summary.apply(
         lambda r: _is_exempt_high_margin(r["Client"], r["Destination"], r["Profit Margin %"]),
         axis=1,
@@ -277,7 +279,6 @@ def run_audit(
     client_summary["Profit Margin %"] = pct(client_summary["Profit"], client_summary["Total_Sell"])
     client_summary = client_summary.sort_values("Profit", ascending=False)
 
-    # 这里只保留真正要算异常的 margin
     margin_outliers = summary[
         summary["Exception_Type"].isin(
             [f"Margin>{int(high_thr*100)}%", f"Margin<{int(low_thr*100)}%"]
@@ -314,7 +315,7 @@ def run_audit(
     chargecode_summary["Profit Margin %"] = pct(chargecode_summary["Profit"], chargecode_summary["Total_Sell"])
     chargecode_summary = chargecode_summary.sort_values("Profit", ascending=False)
 
-    mawb_flags = summary[["MAWB", "Exception_Type"]].copy()
+    mawb_flags = summary[["MAWB", "Exception_Type", "Profit"]].copy()
     mawb_charge = df[["MAWB", "Charge Code"]].drop_duplicates()
     cc_exc = mawb_charge.merge(mawb_flags, on="MAWB", how="left")
 
@@ -329,8 +330,18 @@ def run_audit(
         .reset_index()
     )
 
+    # 新增 Profit<0 计数
+    cc_profit_neg = (
+        cc_exc[cc_exc["Profit"] < 0]
+        .groupby("Charge Code")["MAWB"]
+        .nunique()
+        .reset_index(name="Profit<0")
+    )
+
     chargecode_summary = (
-        chargecode_summary.merge(chargecode_exceptions, on="Charge Code", how="left")
+        chargecode_summary
+        .merge(chargecode_exceptions, on="Charge Code", how="left")
+        .merge(cc_profit_neg, on="Charge Code", how="left")
         .fillna(0)
     )
 
@@ -348,7 +359,7 @@ def run_audit(
     vendor_summary = vendor_summary.sort_values("Profit", ascending=False)
 
     mawb_vendor = df[["MAWB", "Vendor"]].drop_duplicates()
-    v_exc = mawb_vendor.merge(mawb_flags, on="MAWB", how="left")
+    v_exc = mawb_vendor.merge(summary[["MAWB", "Exception_Type"]], on="MAWB", how="left")
 
     vendor_exceptions = (
         v_exc.pivot_table(
@@ -379,8 +390,12 @@ def run_audit(
     cc_mawb["Profit Margin %"] = pct(cc_mawb["Profit"], cc_mawb["Total_Sell"])
     cc_mawb["ETA Month"] = pd.to_datetime(cc_mawb["ETA"], errors="coerce").dt.to_period("M").astype(str).replace("NaT", "")
 
+    # 删除 Cost=Sell=0
     chargecode_profit_le0_mawb = (
-        cc_mawb[cc_mawb["Profit"] <= 0]
+        cc_mawb[
+            (cc_mawb["Profit"] <= 0) &
+            ~((cc_mawb["Total_Cost"] == 0) & (cc_mawb["Total_Sell"] == 0))
+        ]
         .copy()
         .sort_values(["Profit", "Total_Sell"], ascending=[True, False])
     )
