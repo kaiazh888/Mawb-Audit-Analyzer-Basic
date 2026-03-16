@@ -92,20 +92,20 @@ def _clean_text_value(x) -> str:
     return s
 
 
-def _is_exempt_high_margin(client: str, destination: str, margin_pct: float) -> bool:
+def _is_exempt_high_margin(client: str, branch: str, margin_pct: float) -> bool:
     if pd.isna(margin_pct):
         return False
 
     client_u = str(client).strip().upper()
-    dest_u = str(destination).strip().upper()
+    branch_u = str(branch).strip().upper()
 
     if margin_pct <= 0.80:
         return False
 
-    if client_u == "HANCAIWUX" and dest_u in {"MIA", "ORD"}:
+    if client_u == "HANCAIWUX" and branch_u in {"MIA", "ORD"}:
         return True
 
-    if client_u == "4PXDIGHKG" and dest_u in {"MIA", "LAX", "ORD"}:
+    if client_u == "4PXDIGHKG" and branch_u in {"MIA", "LAX", "ORD"}:
         return True
 
     return False
@@ -189,11 +189,18 @@ def run_audit(
                 mdf["MAWB"] = mdf0[m_mawb].apply(normalize_mawb)
                 mdf["ETA"] = clean_eta_series(mdf0[m_eta])
 
-                # Destination 固定取 ETA 上传表 F 列（第6列，index=5）
-                if len(mdf0.columns) >= 6:
-                    mdf["Destination"] = mdf0.iloc[:, 5].apply(_clean_text_value).str.upper()
+                # 优先按表头 Destination 取；如果没有，再回退到第6列(F列)
+                branch_col = find_first_col(
+                    mdf0,
+                    ["Destination", "Dest", "Branch", "Station", "To"]
+                )
+
+                if branch_col:
+                    mdf["Branch"] = mdf0[branch_col].apply(_clean_text_value).str.upper()
+                elif len(mdf0.columns) >= 6:
+                    mdf["Branch"] = mdf0.iloc[:, 5].apply(_clean_text_value).str.upper()
                 else:
-                    mdf["Destination"] = "UNKNOWN"
+                    mdf["Branch"] = "UNKNOWN"
 
                 bad_eta_rows = int(mdf["ETA"].isna().sum())
                 total_rows = int(len(mdf))
@@ -207,7 +214,7 @@ def run_audit(
                     .groupby("MAWB", as_index=False)
                     .agg(
                         ETA=("ETA", "max"),
-                        Destination=("Destination", "first"),
+                        Branch=("Branch", "first"),
                     )
                 )
 
@@ -215,17 +222,15 @@ def run_audit(
         df = df.merge(eta_map, on="MAWB", how="left")
     else:
         df["ETA"] = pd.NaT
-        df["Destination"] = "UNKNOWN"
+        df["Branch"] = "UNKNOWN"
 
     df["ETA"] = pd.to_datetime(df["ETA"], errors="coerce").dt.normalize()
-    df["Destination"] = df["Destination"].fillna("UNKNOWN").astype(str).str.upper()
-    df["Branch"] = df["Destination"]
+    df["Branch"] = df["Branch"].fillna("UNKNOWN").astype(str).str.upper()
 
     summary = (
         df.groupby("MAWB", as_index=False)
         .agg(
             Client=("Client", "first"),
-            Destination=("Destination", "first"),
             Branch=("Branch", "first"),
             Total_Cost=("Cost Amount", "sum"),
             Total_Sell=("Sell Amount", "sum"),
@@ -239,7 +244,7 @@ def run_audit(
     summary["Profit Margin %"] = pct(summary["Profit"], summary["Total_Sell"])
 
     summary["High_Margin_Exempt"] = summary.apply(
-        lambda r: _is_exempt_high_margin(r["Client"], r["Destination"], r["Profit Margin %"]),
+        lambda r: _is_exempt_high_margin(r["Client"], r["Branch"], r["Profit Margin %"]),
         axis=1,
     )
 
@@ -330,7 +335,6 @@ def run_audit(
         .reset_index()
     )
 
-    # 新增 Profit<0 计数
     cc_profit_neg = (
         cc_exc[cc_exc["Profit"] < 0]
         .groupby("Charge Code")["MAWB"]
@@ -378,7 +382,6 @@ def run_audit(
         df.groupby(["MAWB", "Charge Code"], as_index=False)
         .agg(
             Client=("Client", "first"),
-            Destination=("Destination", "first"),
             Branch=("Branch", "first"),
             Vendor=("Vendor", "first"),
             Total_Cost=("Cost Amount", "sum"),
@@ -390,7 +393,6 @@ def run_audit(
     cc_mawb["Profit Margin %"] = pct(cc_mawb["Profit"], cc_mawb["Total_Sell"])
     cc_mawb["ETA Month"] = pd.to_datetime(cc_mawb["ETA"], errors="coerce").dt.to_period("M").astype(str).replace("NaT", "")
 
-    # 删除 Cost=Sell=0
     chargecode_profit_le0_mawb = (
         cc_mawb[
             (cc_mawb["Profit"] <= 0) &
