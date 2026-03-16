@@ -127,9 +127,14 @@ def build_excel_report(result) -> bytes:
                 except Exception:
                     ws.write(neg_row + 2 + i, 1, str(v))
 
+        # 第一个tab里的 ChargeCode_Summary 去掉指定列，加入 Profit<0
+        cc_embed = result.chargecode_summary.copy()
+        drop_cols = ["Margin<30%", "Margin>80%", "Revenue=0"]
+        cc_embed = cc_embed[[c for c in cc_embed.columns if c not in drop_cols]]
+
         cc_row = neg_row + 6
         ws.write(cc_row, 0, "ChargeCode_Summary (embedded)", subheader_fmt)
-        result.chargecode_summary.to_excel(
+        cc_embed.to_excel(
             writer,
             index=False,
             sheet_name="Analysis Summary",
@@ -138,12 +143,12 @@ def build_excel_report(result) -> bytes:
         )
 
         try:
-            pm_idx = list(result.chargecode_summary.columns).index("Profit Margin %")
+            pm_idx = list(cc_embed.columns).index("Profit Margin %")
             _set_col_format(ws, workbook, pm_idx, width=16, num_format=PERCENT_FMT, startcol=0)
         except Exception:
             pass
 
-        v_row = cc_row + 2 + len(result.chargecode_summary) + 3
+        v_row = cc_row + 2 + len(cc_embed) + 3
         ws.write(v_row, 0, "Vendor_Summary (embedded)", subheader_fmt)
         result.vendor_summary.to_excel(
             writer,
