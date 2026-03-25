@@ -186,15 +186,12 @@ def _classify_margin_exception(
     codes = {str(x).strip().upper() for x in (active_codes or set()) if str(x).strip()}
     special_codes = {"THAWB", "DDOC"}
 
-    # ---- 规则 A ----
     if client_u in {"HANCAIWUX", "4PXDIGHKG"}:
-        # 仅有 THAWB / DDOC（且至少有一个）
         if codes and codes.issubset(special_codes):
             if pd.notna(profit_margin) and profit_margin < 0.85:
                 return "Margin<85%"
             return ""
 
-    # ---- 规则 B ----
     if client_u in {"SHELIUSZX", "LIBEXPLHR"}:
         if "THAWB" not in codes:
             if pd.notna(profit_margin):
@@ -204,7 +201,6 @@ def _classify_margin_exception(
                     return f"Margin<{int(low_thr*100)}%"
             return ""
 
-    # ---- 默认规则 ----
     if pd.notna(profit_margin):
         if profit_margin > high_thr:
             return f"Margin>{int(high_thr*100)}%"
@@ -218,24 +214,21 @@ def _keep_chargecode_negative_exception(row) -> bool:
     """
     code级负利润异常规则：
     1) WHALECBOS 的 TISC/TABD/DSTOR：profit < -10 才算异常
-    2) 所有客户的 TISC：如果 profit > -10，则不算异常
-       => 只有 profit <= -10 的 TISC 才保留
-    3) 其他 code：profit <= 0 即保留
+    2) 所有客户的 TISC：只有 profit < -10 才算异常
+    3) 其他 code：只有 profit < 0 才算异常
     """
     client = str(row.get("Client", "")).strip().upper()
     code = str(row.get("Charge Code", "")).strip().upper()
-    profit = float(row.get("Profit", 0) if pd.notna(row.get("Profit", 0)) else 0)
+    profit_val = row.get("Profit", 0)
+    profit = float(profit_val) if pd.notna(profit_val) else 0.0
 
-    # 全局 TISC 规则
     if code == "TISC":
-        return profit <= -10
+        return profit < -10
 
-    # WHALECBOS 特殊规则
     if client == "WHALECBOS" and code in {"TABD", "DSTOR"}:
         return profit < -10
 
-    # 其他 code 默认 profit<=0 保留
-    return profit <= 0
+    return profit < 0
 
 
 @st.cache_data(show_spinner=False)
@@ -248,7 +241,6 @@ def run_audit(
 ) -> AuditResult:
     MARGIN_LABEL = f"Margin<{int(low_thr*100)}% or >{int(high_thr*100)}%"
 
-    # ---- Read billing charges ----
     xls = pd.ExcelFile(billing_file)
     billing_sheet = find_sheet_with_required_cols(xls, BILLING_REQUIRED)
     if not billing_sheet:
@@ -268,7 +260,6 @@ def run_audit(
     if not (mawb_col and cost_col and sell_col):
         raise ValueError("Billing sheet found but required columns could not be detected after scanning.")
 
-    # ---- Normalize billing ----
     df = raw_df.copy()
     df["MAWB"] = df[mawb_col].apply(normalize_mawb)
     df["Cost Amount"] = safe_numeric(df[cost_col])
@@ -291,7 +282,6 @@ def run_audit(
 
     df = df[df["MAWB"].ne("")].copy()
 
-    # ---- Optional MAWB filter ----
     mawb_keep = parse_mawb_list(mawb_text)
     if mawb_keep:
         df = df[df["MAWB"].isin(mawb_keep)].copy()
@@ -302,10 +292,8 @@ def run_audit(
         mawb_not_found = []
         mawb_not_found_df = pd.DataFrame({"MAWB": []})
 
-    # ---- PROCARESX match before ETA / summary ----
     df = _apply_procaresx_match(df)
 
-    # ---- Read ETA mapping (optional) ----
     eta_map = None
     eta_parse_note = None
 
@@ -323,7 +311,6 @@ def run_audit(
                 mdf["MAWB"] = mdf0[m_mawb].apply(normalize_mawb)
                 mdf["ETA"] = clean_eta_series(mdf0[m_eta])
 
-                # Branch：优先按表头找；找不到再回退 F 列
                 branch_col = find_first_col(mdf0, ["Destination", "Dest", "Branch", "Station", "To"])
                 if branch_col:
                     mdf["Branch"] = mdf0[branch_col].apply(_clean_text_value).str.upper()
@@ -348,7 +335,6 @@ def run_audit(
                     )
                 )
 
-    # ---- Merge ETA into billing ----
     if eta_map is not None and not eta_map.empty:
         df = df.merge(eta_map, on="MAWB", how="left")
     else:
@@ -358,10 +344,8 @@ def run_audit(
     df["ETA"] = pd.to_datetime(df["ETA"], errors="coerce").dt.normalize()
     df["Branch"] = df["Branch"].fillna("UNKNOWN").astype(str).str.upper()
 
-    # ---- MAWB active codes ----
     mawb_active_codes = _build_mawb_active_codes(df)
 
-    # ---- MAWB summary ----
     summary = (
         df.groupby("MAWB", as_index=False)
         .agg(
@@ -400,7 +384,6 @@ def run_audit(
 
     exceptions = summary[summary["Classification"].eq("Open")].copy()
 
-    # ---- Client Summary ----
     client_summary = (
         df.groupby("Client", as_index=False)
         .agg(
@@ -415,15 +398,12 @@ def run_audit(
     client_summary["Profit Margin %"] = pct(client_summary["Profit"], client_summary["Total_Sell"])
     client_summary = client_summary.sort_values("Profit", ascending=False)
 
-    # ---- Margin Outliers ----
     margin_outliers = summary[
         summary["Exception_Type"].astype(str).str.startswith("Margin")
     ].copy().sort_values("Profit Margin %")
 
-    # ---- Negative Profit ----
     negative_profit = summary[summary["Profit"] < 0].copy().sort_values("Profit")
 
-    # ---- Zero buckets ----
     zero_margin = summary[summary["Profit Margin %"] == 0].copy().sort_values(
         ["Total_Sell", "Total_Cost"], ascending=False
     )
@@ -439,7 +419,6 @@ def run_audit(
         "Total_Sell", ascending=False
     )
 
-    # ---- Charge Code Profit <= 0 by MAWB ----
     cc_mawb = (
         df.groupby(["MAWB", "Charge Code"], as_index=False)
         .agg(
@@ -462,7 +441,6 @@ def run_audit(
         .copy()
     )
 
-    # 按新规则过滤 code 级异常
     chargecode_profit_le0_mawb = chargecode_profit_le0_mawb[
         chargecode_profit_le0_mawb.apply(_keep_chargecode_negative_exception, axis=1)
     ].copy()
@@ -471,7 +449,6 @@ def run_audit(
         ["Profit", "Total_Sell"], ascending=[True, False]
     )
 
-    # ---- Charge Code Summary ----
     chargecode_summary = (
         df.groupby("Charge Code", as_index=False)
         .agg(
@@ -500,9 +477,9 @@ def run_audit(
         .reset_index()
     )
 
-    # Profit<0 列：使用新规则过滤后的 code 级异常结果
     cc_profit_neg = (
-        chargecode_profit_le0_mawb.groupby("Charge Code")["MAWB"]
+        chargecode_profit_le0_mawb[chargecode_profit_le0_mawb["Profit"] < 0]
+        .groupby("Charge Code")["MAWB"]
         .nunique()
         .reset_index(name="Profit<0")
     )
@@ -514,7 +491,6 @@ def run_audit(
         .fillna(0)
     )
 
-    # ---- Vendor Summary ----
     vendor_summary = (
         df.groupby("Vendor", as_index=False)
         .agg(
@@ -544,7 +520,6 @@ def run_audit(
 
     vendor_summary = vendor_summary.merge(vendor_exceptions, on="Vendor", how="left").fillna(0)
 
-    # ---- KPI / Summary numbers ----
     total_mawb = int(len(summary))
     closed_cnt = int((summary["Classification"] == "Closed").sum())
     open_cnt = total_mawb - closed_cnt
@@ -568,7 +543,6 @@ def run_audit(
         "Cost=Sell=0 Count": int((summary["Exception_Type"] == "Cost=Sell=0").sum()),
     }
 
-    # 动态加入所有 Margin 类异常计数
     margin_labels = sorted(
         x for x in summary["Exception_Type"].dropna().astype(str).unique()
         if x.startswith("Margin")
@@ -595,7 +569,6 @@ def run_audit(
         ]
     )
 
-    # ---- Display versions for Streamlit ----
     display_summary = display_df(summary, date_cols=["ETA"])
     display_exceptions = display_df(exceptions, date_cols=["ETA"])
     display_client_summary = display_df(client_summary, date_cols=["Latest_ETA"])
