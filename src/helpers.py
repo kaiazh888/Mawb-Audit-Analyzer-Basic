@@ -1,125 +1,143 @@
+from __future__ import annotations
+
 import re
 import pandas as pd
 
 
 def safe_numeric(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce").fillna(0)
+    if s is None:
+        return pd.Series(dtype="float64")
+
+    s2 = (
+        s.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.strip()
+    )
+    return pd.to_numeric(s2, errors="coerce").fillna(0.0)
 
 
-def norm_colname(s: str) -> str:
-    return re.sub(r"[\s_\-]+", "", str(s).strip().lower())
+def find_first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    if df is None:
+        return None
+
+    norm_map = {str(c).strip().lower(): c for c in df.columns}
+    for c in candidates:
+        key = str(c).strip().lower()
+        if key in norm_map:
+            return norm_map[key]
+    return None
 
 
-def find_first_col(df: pd.DataFrame, candidates: list[str]) -> str:
-    mapping = {norm_colname(c): c for c in df.columns.astype(str)}
-    for cand in candidates:
-        key = norm_colname(cand)
-        if key in mapping:
-            return mapping[key]
-    return ""
-
-
-def find_sheet_with_required_cols(xls: pd.ExcelFile, required_candidates: dict[str, list[str]]) -> str:
-    for sh in xls.sheet_names:
+def find_sheet_with_required_cols(xls: pd.ExcelFile, required: dict[str, list[str]]) -> str | None:
+    for sheet in xls.sheet_names:
         try:
-            tmp = pd.read_excel(xls, sheet_name=sh, nrows=60)
+            preview = pd.read_excel(xls, sheet_name=sheet, nrows=5)
         except Exception:
             continue
 
         ok = True
-        for _, cand_list in required_candidates.items():
-            if not find_first_col(tmp, cand_list):
+        for _, candidates in required.items():
+            if find_first_col(preview, candidates) is None:
                 ok = False
                 break
         if ok:
-            return sh
-    return ""
+            return sheet
+
+    return None
 
 
-def pct(numer: pd.Series, denom: pd.Series) -> pd.Series:
-    return (numer / denom).where(denom != 0, 0)
-
-
-def normalize_mawb(x: str) -> str:
-    if x is None:
-        return ""
-    s = str(x).strip().upper()
-    if not s or s in {"NAN", "NONE"}:
+def normalize_mawb(x) -> str:
+    if pd.isna(x):
         return ""
 
-    s_alnum = re.sub(r"[^0-9A-Z]", "", s)
+    s = str(x).strip()
+    if not s:
+        return ""
 
-    # digits 11 => 3+8
-    if s_alnum.isdigit() and len(s_alnum) == 11:
-        return f"{s_alnum[:3]}-{s_alnum[3:]}"
-    # digits 12 => take last 11
-    if s_alnum.isdigit() and len(s_alnum) == 12:
-        s11 = s_alnum[-11:]
-        return f"{s11[:3]}-{s11[3:]}"
-    return s_alnum
+    s = s.replace(" ", "")
+    s = re.sub(r"[^0-9\-]", "", s)
+
+    digits = re.sub(r"[^0-9]", "", s)
+    if len(digits) == 11:
+        return f"{digits[:3]}-{digits[3:]}"
+    return s
 
 
-def parse_mawb_list(text: str) -> list[str]:
-    if not text or not str(text).strip():
+def parse_mawb_list(mawb_text: str) -> list[str]:
+    if not mawb_text or not str(mawb_text).strip():
         return []
-    tokens = re.split(r"[,\s]+", str(text).strip())
-    tokens = [normalize_mawb(t) for t in tokens if str(t).strip()]
-    tokens = [t for t in tokens if t]
-    return sorted(set(tokens))
+
+    raw = re.split(r"[\s,;]+", str(mawb_text).strip())
+    vals = [normalize_mawb(x) for x in raw if str(x).strip()]
+    vals = [x for x in vals if x]
+    return list(dict.fromkeys(vals))
 
 
 def clean_eta_series(s: pd.Series) -> pd.Series:
-    """
-    Robust ETA parser (text) + normalize to DATE (no time).
-    """
-    s = s.astype(str).fillna("").str.strip()
-    s = s.str.replace(r"(?i)^\s*eta\s*[:\-]\s*", "", regex=True)
-    s = s.str.replace(r"\s+", " ", regex=True)
+    if s is None:
+        return pd.Series(dtype="datetime64[ns]")
 
-    # YYYYMMDD
-    yyyymmdd = s.str.match(r"^\d{8}$")
-    s2 = s.copy()
-    if yyyymmdd.any():
-        parsed = pd.to_datetime(s.loc[yyyymmdd], format="%Y%m%d", errors="coerce")
-        s2.loc[yyyymmdd] = parsed.astype("datetime64[ns]").astype(str)
-
-    dt1 = pd.to_datetime(s2, errors="coerce", infer_datetime_format=True)
-
-    mask = dt1.isna() & s2.ne("")
-    if mask.any():
-        dt2 = pd.to_datetime(s2[mask], errors="coerce", dayfirst=True, infer_datetime_format=True)
-        dt1.loc[mask] = dt2
-
-    return dt1.dt.normalize()
+    s2 = s.astype(str).str.strip()
+    s2 = s2.replace(
+        {
+            "": None,
+            "nan": None,
+            "NaN": None,
+            "None": None,
+            "NULL": None,
+            "N/A": None,
+            "NA": None,
+        }
+    )
+    return pd.to_datetime(s2, errors="coerce")
 
 
-def to_date_only(df_in: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    df_out = df_in.copy()
-    for c in cols:
-        if c in df_out.columns:
-            df_out[c] = pd.to_datetime(df_out[c], errors="coerce").dt.date
-    return df_out
+def pct(num, den):
+    num_s = pd.Series(num) if not isinstance(num, pd.Series) else num
+    den_s = pd.Series(den) if not isinstance(den, pd.Series) else den
+
+    out = num_s / den_s.replace(0, pd.NA)
+    return out.fillna(0.0)
 
 
 def format_pct_str(x) -> str:
     try:
+        if pd.isna(x):
+            return ""
         return f"{float(x) * 100:.2f}%"
     except Exception:
         return ""
 
 
-def display_df(df_in: pd.DataFrame, date_cols: list[str] | None = None) -> pd.DataFrame:
-    """
-    For Streamlit display only: convert date columns to date-only, and % columns to formatted strings.
-    Does NOT mutate original input df.
-    """
-    out = df_in.copy()
-    if date_cols:
-        out = to_date_only(out, date_cols)
+def display_df(df: pd.DataFrame, date_cols: list[str] | None = None) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
 
-    # common % columns
-    for col in ["Profit Margin %", "Closed %", "ETA Filled %", "Overall Profit Margin %"]:
-        if col in out.columns:
-            out[col] = out[col].apply(format_pct_str)
+    out = df.copy()
+    date_cols = date_cols or []
+
+    for c in date_cols:
+        if c in out.columns:
+            out[c] = pd.to_datetime(out[c], errors="coerce").dt.strftime("%Y-%m-%d")
+            out[c] = out[c].fillna("")
+
+    for c in out.columns:
+        if "margin" in str(c).lower() and pd.api.types.is_numeric_dtype(out[c]):
+            out[c] = out[c].apply(lambda x: format_pct_str(x) if pd.notna(x) else "")
+
+    return out
+
+
+def to_date_only(df: pd.DataFrame, date_cols: list[str] | None = None) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+
+    out = df.copy()
+    date_cols = date_cols or []
+
+    for c in date_cols:
+        if c in out.columns:
+            out[c] = pd.to_datetime(out[c], errors="coerce").dt.normalize()
 
     return out
